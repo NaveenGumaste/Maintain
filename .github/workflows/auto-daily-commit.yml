@@ -5,7 +5,7 @@ permissions:
 
 on:
   schedule:
-    - cron: "0 * * * *" # every hour (UTC) — runs at :00 each hour; we use IST for day boundaries below
+    - cron: "0 * * * *" # every hour (UTC) — we use IST for day boundaries below
   workflow_dispatch:
 
 env:
@@ -41,11 +41,12 @@ jobs:
           TODAY=$(TZ="Asia/Kolkata" date +%Y-%m-%d)
           HOUR=$(TZ="Asia/Kolkata" date +%H)
           MIN=$(TZ="Asia/Kolkata" date +%M)
+          # Only valid name=value lines must be written to GITHUB_OUTPUT
           echo "today=$TODAY" >> $GITHUB_OUTPUT
           echo "hour=$HOUR" >> $GITHUB_OUTPUT
           echo "min=$MIN" >> $GITHUB_OUTPUT
 
-      - name: Pick or read today's target and persist (committed)
+      - name: Pick or read today's target and persist (committed) [fixed]
         id: meta
         run: |
           set -euo pipefail
@@ -58,20 +59,31 @@ jobs:
           mkdir -p "$MDIR"
 
           if [ -f "$META" ]; then
-            TARGET=$(cat "$META")
-            echo "Found existing target: $TARGET"
-          else
-            RANGE=$((MAXC - MINC + 1))
-            TARGET=$((MINC + RANDOM % RANGE))
-            echo "$TARGET" > "$META"
-            echo "created_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$META"
-            git add "$META"
-            # commit and push the meta file immediately so subsequent runs can read it
-            git -c user.name="${{ secrets.COMMIT_NAME }}" -c user.email="${{ secrets.COMMIT_EMAIL }}" \
-              commit -m "chore(auto): set daily target $TARGET for $TODAY" || echo "No changes to commit for meta"
-            git push origin HEAD || echo "Meta push failed (will be retried next run)"
+            # Read only the first line (should be numeric target). Trim whitespace.
+            TARGET=$(sed -n '1p' "$META" | tr -d '\r\n' | tr -d ' ' || true)
+            if ! printf '%s' "$TARGET" | grep -Eq '^[0-9]+$'; then
+              echo "Warning: meta file exists but first line is not numeric. Recreating meta."
+              rm -f "$META"
+            else
+              echo "Found existing numeric target: $TARGET"
+            fi
           fi
 
+          if [ ! -f "$META" ]; then
+            RANGE=$((MAXC - MINC + 1))
+            TARGET=$((MINC + RANDOM % RANGE))
+            # Write strict format: first line = numeric target, second line = ISO timestamp
+            printf "%s\n%s\n" "$TARGET" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$META"
+            git add "$META" || true
+
+            # Try to commit & push meta; do not fail the job if push fails (concurrency/permissions)
+            git -c user.name="${{ secrets.COMMIT_NAME }}" -c user.email="${{ secrets.COMMIT_EMAIL }}" \
+               commit -m "chore(auto): set daily target $TARGET for $TODAY" || echo "No meta changes to commit"
+            git push origin HEAD || echo "Meta push failed (will be retried next run)"
+            echo "Created and persisted new target: $TARGET"
+          fi
+
+          # IMPORTANT: write only a valid name=value line to GITHUB_OUTPUT
           echo "target=$TARGET" >> $GITHUB_OUTPUT
 
       - name: Count today's commits on current branch (IST day)
@@ -79,10 +91,13 @@ jobs:
         run: |
           set -euo pipefail
           TODAY="${{ steps.prep.outputs.today }}"
+          # Use IST day boundary
           SINCE="$(TZ='Asia/Kolkata' date -d "${TODAY} 00:00:00" --iso-8601=seconds)"
           BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          # Count commits on this branch since SINCE (includes manual + auto commits)
           COUNT=$(git log --first-parent --pretty=%H --since="${SINCE}" "${BRANCH}" | wc -l || true)
           COUNT=$(echo "${COUNT}" | tr -d '[:space:]')
+          # Output valid name=value
           echo "today_count=$COUNT" >> $GITHUB_OUTPUT
 
       - name: Decide whether to commit this hour
@@ -140,7 +155,7 @@ jobs:
           FILE="${MDIR}/${TODAY}.txt"
           TIMESTAMP="$(TZ='Asia/Kolkata' date +'%Y-%m-%d %H:%M:%S %Z')"
           echo "Auto commit at ${TIMESTAMP} (run $GITHUB_RUN_ID)" >> "$FILE"
-          git add "$FILE"
+          git add "$FILE" || true
 
           git -c user.name="${{ secrets.COMMIT_NAME }}" -c user.email="${{ secrets.COMMIT_EMAIL }}" \
             commit -m "chore(auto): daily random streak ${TODAY} @ ${TIMESTAMP}" || {
