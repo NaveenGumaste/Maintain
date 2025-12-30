@@ -1,0 +1,50 @@
+name: Auto daily commit - Safe
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  END_DATE: "2026-01-15"
+  MAX_FILES_PER_RUN: "2"
+  FILES: "README.md src/config.json"
+
+jobs:
+  auto-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Stop after END_DATE
+        run: |
+          TODAY=$(date -u +"%Y-%m-%d")
+          if [[ "$TODAY" > "${END_DATE}" ]]; then
+            echo "Automation window ended."
+            exit 0
+          fi
+
+      - name: Create daily log file
+        run: |
+          DATE=$(date -u +"%Y-%m-%d")
+          mkdir -p daily-streak
+          FILE="daily-streak/${DATE}.txt"
+
+          echo "Daily auto commit" > "$FILE"
+          echo "Date (UTC): $DATE" >> "$FILE"
+          echo "Repository: $GITHUB_REPOSITORY" >> "$FILE"
+          echo "Run ID: $GITHUB_RUN_ID" >> "$FILE"
+
+          git add "$FILE"
+
+      - name: Commit and push
+        run: |
+          git config user.name "${{ secrets.COMMIT_NAME }}"
+          git config user.email "${{ secrets.COMMIT_EMAIL }}"
+
+          git commit -m "chore: daily streak commit $(date -u +"%Y-%m-%d")" || exit 0
+          git push
