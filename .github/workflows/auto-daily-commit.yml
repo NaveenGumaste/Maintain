@@ -1,53 +1,160 @@
-name: Auto daily commit - Safe
+name: Auto daily random commits (IST, hourly, stop 2026-01-15)
 
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 * * * *" # every hour (UTC) — runs at :00 each hour; we use IST for day boundaries below
   workflow_dispatch:
 
 env:
-  END_DATE: "2026-01-15"
-  MAX_FILES_PER_RUN: "2"
-  FILES: "README.md src/config.json"
+  MIN_COMMITS: "4"
+  MAX_COMMITS: "8"
+  INTERVAL_MINUTES: "60" # hourly
+  STREAK_DIR: "daily-streak"
+  END_DATE: "2026-01-15" # last inclusive date (YYYY-MM-DD)
 
 jobs:
-  auto-commit:
+  random-commits:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout (full history required)
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: true
 
-      - name: Stop after END_DATE
+      - name: Stop after END_DATE (IST)
         run: |
-          TODAY=$(date -u +"%Y-%m-%d")
-          if [[ "$TODAY" > "${END_DATE}" ]]; then
-            echo "Automation window ended."
+          set -euo pipefail
+          TODAY_IST=$(TZ="Asia/Kolkata" date +%Y-%m-%d)
+          if [ -n "$END_DATE" ] && [[ "$TODAY_IST" > "$END_DATE" ]]; then
+            echo "Automation window ended ($TODAY_IST > $END_DATE). Exiting."
             exit 0
           fi
 
-      - name: Create daily log file
+      - name: Prepare environment - date/time (IST)
+        id: prep
         run: |
-          DATE=$(date -u +"%Y-%m-%d")
-          mkdir -p daily-streak
-          FILE="daily-streak/${DATE}.txt"
+          set -euo pipefail
+          TODAY=$(TZ="Asia/Kolkata" date +%Y-%m-%d)
+          HOUR=$(TZ="Asia/Kolkata" date +%H)
+          MIN=$(TZ="Asia/Kolkata" date +%M)
+          echo "today=$TODAY" >> $GITHUB_OUTPUT
+          echo "hour=$HOUR" >> $GITHUB_OUTPUT
+          echo "min=$MIN" >> $GITHUB_OUTPUT
 
-          echo "Daily auto commit" > "$FILE"
-          echo "Date (UTC): $DATE" >> "$FILE"
-          echo "Repository: $GITHUB_REPOSITORY" >> "$FILE"
-          echo "Run ID: $GITHUB_RUN_ID" >> "$FILE"
+      - name: Pick or read today's target and persist (committed)
+        id: meta
+        run: |
+          set -euo pipefail
+          TODAY="${{ steps.prep.outputs.today }}"
+          MINC=${{ env.MIN_COMMITS }}
+          MAXC=${{ env.MAX_COMMITS }}
+          MDIR="${{ env.STREAK_DIR }}"
+          META="$MDIR/$TODAY.meta"
 
+          mkdir -p "$MDIR"
+
+          if [ -f "$META" ]; then
+            TARGET=$(cat "$META")
+            echo "Found existing target: $TARGET"
+          else
+            RANGE=$((MAXC - MINC + 1))
+            TARGET=$((MINC + RANDOM % RANGE))
+            echo "$TARGET" > "$META"
+            echo "created_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$META"
+            git add "$META"
+            # commit and push the meta file immediately so subsequent runs can read it
+            git -c user.name="${{ secrets.COMMIT_NAME }}" -c user.email="${{ secrets.COMMIT_EMAIL }}" \
+              commit -m "chore(auto): set daily target $TARGET for $TODAY" || echo "No changes to commit for meta"
+            git push origin HEAD || echo "Meta push failed (will be retried next run)"
+          fi
+
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+
+      - name: Count today's commits on current branch (IST day)
+        id: count
+        run: |
+          set -euo pipefail
+          TODAY="${{ steps.prep.outputs.today }}"
+          SINCE="$(TZ='Asia/Kolkata' date -d "${TODAY} 00:00:00" --iso-8601=seconds)"
+          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          COUNT=$(git log --first-parent --pretty=%H --since="${SINCE}" "${BRANCH}" | wc -l || true)
+          COUNT=$(echo "${COUNT}" | tr -d '[:space:]')
+          echo "today_count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Decide whether to commit this hour
+        id: decide
+        run: |
+          set -euo pipefail
+          TARGET=${{ steps.meta.outputs.target }}
+          TODAY_COUNT=${{ steps.count.outputs.today_count }}
+          INTERVAL=${{ env.INTERVAL_MINUTES }}
+          HOUR=${{ steps.prep.outputs.hour }}
+          MIN=${{ steps.prep.outputs.min }}
+
+          SLOTS_PER_DAY=$((1440 / INTERVAL))
+          MIN_TOTAL=$((10#$MIN))
+          HR_TOTAL=$((10#$HOUR))
+          SLOT_INDEX=$(( (HR_TOTAL * 60 + MIN_TOTAL) / INTERVAL ))
+          REMAINING_SLOTS=$(( SLOTS_PER_DAY - SLOT_INDEX ))
+
+          REMAINING_NEEDED=$(( TARGET - TODAY_COUNT ))
+
+          echo "target=$TARGET"
+          echo "today_count=$TODAY_COUNT"
+          echo "slot_index=$SLOT_INDEX"
+          echo "remaining_slots=$REMAINING_SLOTS"
+          echo "remaining_needed=$REMAINING_NEEDED"
+
+          if [ "$REMAINING_NEEDED" -le 0 ]; then
+            echo "commit_now=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$REMAINING_SLOTS" -le 0 ]; then
+            echo "commit_now=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$REMAINING_NEEDED" -ge "$REMAINING_SLOTS" ]; then
+            echo "commit_now=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          R=$((RANDOM % REMAINING_SLOTS))
+          if [ "$R" -lt "$REMAINING_NEEDED" ]; then
+            echo "commit_now=true" >> $GITHUB_OUTPUT
+          else
+            echo "commit_now=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create commit if selected (appends entry)
+        if: ${{ steps.decide.outputs.commit_now == 'true' }}
+        run: |
+          set -euo pipefail
+          TODAY="${{ steps.prep.outputs.today }}"
+          MDIR="${{ env.STREAK_DIR }}"
+          FILE="${MDIR}/${TODAY}.txt"
+          TIMESTAMP="$(TZ='Asia/Kolkata' date +'%Y-%m-%d %H:%M:%S %Z')"
+          echo "Auto commit at ${TIMESTAMP} (run $GITHUB_RUN_ID)" >> "$FILE"
           git add "$FILE"
 
-      - name: Commit and push
-        run: |
-          git config user.name "${{ secrets.COMMIT_NAME }}"
-          git config user.email "${{ secrets.COMMIT_EMAIL }}"
+          git -c user.name="${{ secrets.COMMIT_NAME }}" -c user.email="${{ secrets.COMMIT_EMAIL }}" \
+            commit -m "chore(auto): daily random streak ${TODAY} @ ${TIMESTAMP}" || {
+              echo "Nothing to commit or commit failed"
+              exit 0
+            }
 
-          git commit -m "chore: daily streak commit $(date -u +"%Y-%m-%d")" || exit 0
-          git push
+          git push origin HEAD || {
+            echo "Push failed"
+            exit 1
+          }
+
+      - name: Done - quick summary
+        run: |
+          echo "Decision: ${{ steps.decide.outputs.commit_now }}"
+          echo "Target: ${{ steps.meta.outputs.target }}"
+          echo "Today count before decision: ${{ steps.count.outputs.today_count }}"
