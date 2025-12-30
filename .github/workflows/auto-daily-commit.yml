@@ -1,5 +1,8 @@
 name: Auto daily commit - Safe
 
+permissions:
+  contents: write
+
 on:
   schedule:
     - cron: "0 6 * * *"
